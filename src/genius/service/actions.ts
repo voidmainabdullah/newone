@@ -1,0 +1,111 @@
+import type { ID } from '#/types'
+import { useWorkflowStore } from '#/stores/collections'
+import { ensureDefaultDashboard } from '#/engine/defaultDashboard'
+import { logPreview, previewWorkflow } from '../workflow/preview'
+import { useGeniusStore } from '../state/geniusStore'
+import type { GeniusVersion, QuestionAnswer } from '../state/types'
+import { createWorkspace, deleteWorkspace } from '#/services/workspaceService'
+import { useWorkspaceStore } from '#/stores/workspaceStore'
+import { useModuleStore } from '#/stores/moduleStore'
+import { suggestIcon, suggestColor } from '../ai/icons'
+import { projectIdFor } from '../compiler/ids'
+import { getTenantId } from '../tenant'
+import { acceptProposal, submitProposal, approveWorkflow, currentActor, rejectProposal, restoreToVersion, setWorkflowEnabled, undoVersion, type AcceptResult, type UndoResult } from './builder'
+
+/**
+ * The user-facing actions of the builder. The configuration lives in the browser, so these run client-side against the
+ * same stores the manual UI uses (there is no server copy of the CRM to act on). Each action is explicit about what the
+ * user must have confirmed:
+ *   - applying a proposal that deletes or removes something needs `confirmDestructive: true`
+ *   - turning on an AI-built or consequential workflow needs `approved: true` AND a recorded dry run of that exact workflow
+ */
+export interface ApplyOptions {
+  confirmDestructive?: boolean
+  /** build into the proposal's own workspace instead of a new empty one (tests, and an empty workspace that is already open) */
+  inPlace?: boolean
+}
+
+export function applyProposal(id: string, opts: ApplyOptions = {}): AcceptResult {
+  const p = useGeniusStore.getState().proposals.find((x) => x.id === id)
+  if (!p) return { ok: false, error: 'Proposal not found', issues: [] }
+  const destructive = p.changes.filter((c) => c.destructive)
+  if (destructive.length && !opts.confirmDestructive) return { ok: false, error: `This change removes or replaces things (${destructive.map((c) => c.label).slice(0, 3).join('; ')}). Confirm explicitly to apply it.`, issues: [] }
+  const res: AcceptResult & { workspaceId?: ID } = p.kind === 'build' && p.state === 'validated' && p.blueprint && !opts.inPlace ? buildInNewWorkspace(p.id) : acceptProposal(id)
+  // publish path: whichever workspace received the build gets its "Overview" dashboard config (idempotent)
+  if (res.ok) ensureDefaultDashboard(res.workspaceId ?? p.workspaceId)
+  return res
+}
+
+/**
+ * A new project always gets its own empty workspace, so its modules, records, overview and automations never mix with another
+ * project. The validated blueprint is re-checked against that fresh workspace (ids are workspace-scoped) and applied there.
+ * An empty workspace that is already open is used as it is.
+ */
+function buildInNewWorkspace(proposalId: string): AcceptResult & { workspaceId?: ID } {
+  const g = useGeniusStore.getState()
+  const p = g.proposals.find((x) => x.id === proposalId)!
+  const here = useWorkspaceStore.getState().workspaces.find((w) => w.id === p.workspaceId)
+  // only an empty PROJECT is reused; the home workspace never receives an AI-built CRM
+  const hereEmpty = here?.kind === 'project' && !!here.blank && !useModuleStore.getState().modules.some((m) => m.workspaceId === p.workspaceId)
+  if (hereEmpty) return { ...acceptProposal(proposalId), workspaceId: p.workspaceId } as AcceptResult & { workspaceId?: ID }
+  const bp = structuredClone(p.blueprint!)
+  const name = (bp.meta.name || p.summary || 'New project').slice(0, 60)
+  const nw = createWorkspace({ name, kind: 'project', switchTo: false, icon: suggestIcon(name), color: suggestColor(useWorkspaceStore.getState().workspaces.length) })
+  bp.meta.projectId = projectIdFor(getTenantId(), nw.id)
+  const { proposal, outcome } = submitProposal(nw.id, { kind: 'build', raw: bp, request: p.request, intent: p.intent, summary: p.summary, assumptions: p.assumptions, questions: p.questions, correlationId: p.correlationId, usage: p.usage, models: p.model?.used, repairAttempts: p.repairAttempts })
+  if (!outcome.report.ok) {
+    useWorkspaceStore.getState().setCurrent(p.workspaceId)
+    deleteWorkspace(nw.id)
+    return { ok: false, error: 'The design no longer validates in a fresh workspace. Nothing was changed.', issues: outcome.report.errors }
+  }
+  const res = acceptProposal(proposal.id)
+  if (res.ok) {
+    g.patchProposal(proposalId, { state: 'superseded' })
+    return { ...res, workspaceId: nw.id }
+  }
+  useWorkspaceStore.getState().setCurrent(p.workspaceId)
+  deleteWorkspace(nw.id)
+  return res
+}
+
+export { rejectProposal }
+
+export const historyOf = (ws: ID): GeniusVersion[] => useGeniusStore.getState().versions.filter((v) => v.workspaceId === ws).sort((a, b) => b.number - a.number)
+
+export function rollback(versionId: string, opts: { force?: boolean } = {}): UndoResult {
+  return undoVersion(versionId, opts)
+}
+
+export function restore(ws: ID, number: number, opts: { force?: boolean } = {}) {
+  return restoreToVersion(ws, number, opts)
+}
+
+/** Remember answers to clarifying questions so they are never asked again. */
+export function answerQuestions(ws: ID, answers: QuestionAnswer[]) {
+  useGeniusStore.getState().recordAnswers(ws, answers)
+}
+
+/** Run (and audit) a dry run so a person can look at it before approving. Reads only. */
+export function reviewWorkflow(workflowId: string) {
+  const wf = useWorkflowStore.getState().items.find((w) => w.id === workflowId)
+  const p = previewWorkflow(workflowId)
+  if (wf && p) logPreview(wf, p, currentActor().userId)
+  return p
+}
+
+export type ActivateResult = { ok: true } | { ok: false; code: string; message: string }
+
+export function activateWorkflow(workflowId: string, opts: { approved: boolean; note?: string }): ActivateResult {
+  const wf = useWorkflowStore.getState().items.find((w) => w.id === workflowId)
+  if (!wf) return { ok: false, code: 'NOT_FOUND', message: 'Workflow not found' }
+  if (!opts.approved) return { ok: false, code: 'APPROVAL_REQUIRED', message: 'Switching a workflow on needs your explicit approval.' }
+  const needsReview = wf.origin === 'ai' || !!wf.consequential
+  if (needsReview) {
+    const reviewed = useGeniusStore.getState().audit.some((a) => a.action === 'dry_run' && a.target === wf.id && a.at >= wf.updatedAt)
+    if (!reviewed) return { ok: false, code: 'DRY_RUN_REQUIRED', message: 'Review the dry run of this workflow first, then approve it.' }
+  }
+  const a = approveWorkflow(workflowId, opts.note)
+  if (!a.ok) return { ok: false, code: a.code, message: a.message }
+  const e = setWorkflowEnabled(workflowId, true)
+  return e.ok ? { ok: true } : { ok: false, code: e.code, message: e.message }
+}
